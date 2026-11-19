@@ -90,9 +90,16 @@ function displayLogin(repo: Repo): string {
 // A stable positive integer id for an object, deterministic from its
 // identity string so it is identical across reads, across surfaces (it
 // matches GraphQL's databaseId for repositories) and across replays.
+// Memoized by seed string: the seed carries the current owner, so an
+// owner change after adoption recomputes instead of reusing a stale id.
+const stableIdCache = new Map<string, number>();
 function stableId(seed: string): number {
+  const cached = stableIdCache.get(seed);
+  if (cached !== undefined) return cached;
   const hash = sha1(Buffer.from(seed, 'utf8'));
-  return (parseInt(hash.slice(0, 8), 16) % 2147483646) + 1;
+  const id = (parseInt(hash.slice(0, 8), 16) % 2147483646) + 1;
+  stableIdCache.set(seed, id);
+  return id;
 }
 
 function repoJson(store: Store, repo: Repo): JsonObject {

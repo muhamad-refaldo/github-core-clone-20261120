@@ -1,49 +1,100 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// HTTP front door for the forge: creates the node:http server and routes each
+// request to the handler that owns its path. Every handler shares the one
+// `store` instance from src/store.ts, so a repository created over REST is
+// visible over the git protocol, GraphQL and MCP alike.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// Routing order:
+//   GET /healthz            -> 200 {"ok":true} (no token)
+//   /{owner}/{repo}.git/... -> the git smart-HTTP handler
+//   POST /api/graphql       -> the GraphQL handler
+//   POST /mcp               -> the MCP handler
+//   /api/v3...              -> the REST v3 handler
+//   anything else           -> 404 {"message":"Not Found"}
+//
+// Every reply carries a non-empty X-GitHub-Request-Id header; the app sets one
+// for each request up front (a counter value from nextRequestId(), never
+// random), and handlers may replace it with their own. JSON replies use
+// application/json; the git handler sets its own content types.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { store } from './src/store.ts';
+import { nextRequestId } from './src/util.ts';
+import { handleGit } from './src/gitproto.ts';
+import { handleGraphql } from './src/graphql.ts';
+import { handleMcp } from './src/mcp.ts';
+import { handleRest } from './src/rest.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+/** Sends a JSON body with the forge's JSON content type. */
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/**
+ * True for git smart-HTTP paths: a first segment (owner), a second segment
+ * ending in ".git" (the repository), and anything after it.
+ */
+function isGitPath(pathname: string): boolean {
+  const parts = pathname.split('/').filter((part) => part !== '');
+  return parts.length >= 2 && parts[1] !== undefined && parts[1].endsWith('.git');
+}
+
+/** Routes one request; a handler that returns false leaves the 404 to us. */
+async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  res.setHeader('X-GitHub-Request-Id', nextRequestId());
+
+  let pathname = req.url ?? '/';
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    pathname = new URL(pathname, 'http://127.0.0.1').pathname;
   } catch {
-    return '/';
+    pathname = pathname.split('?')[0] ?? '/';
   }
+  const method = req.method ?? 'GET';
+
+  if (method === 'GET' && pathname === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (isGitPath(pathname)) {
+    if (await handleGit(req, res, store)) return;
+  }
+
+  if (method === 'POST' && pathname === '/api/graphql') {
+    if (await handleGraphql(req, res, store)) return;
+  }
+
+  if (method === 'POST' && pathname === '/mcp') {
+    if (await handleMcp(req, res, store)) return;
+  }
+
+  if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+    if (await handleRest(req, res, store)) return;
+  }
+
+  sendJson(res, 404, { message: 'Not Found' });
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** Builds the server. main.ts binds it to an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+  return createServer((req, res) => {
+    dispatch(req, res).catch((err: unknown) => {
+      if (!res.headersSent) {
+        try {
+          sendJson(res, 500, { message: 'Internal Server Error' });
+        } catch {
+          // The socket is already gone; nothing left to answer.
+        }
+      } else {
+        try {
+          res.end();
+        } catch {
+          // The socket is already gone; nothing left to answer.
+        }
+      }
+      process.stderr.write(
+        `[app] dispatch failed: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    });
   });
 }

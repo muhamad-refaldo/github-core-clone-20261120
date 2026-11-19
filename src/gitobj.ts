@@ -172,16 +172,52 @@ function readDeltaVarint(buf: Buffer, pos: number): { value: number; next: numbe
   return { value, next: p };
 }
 
+// Adler-32 of `data`, as the zlib wrapper stores it (RFC 1950): two
+// 16-bit sums modulo 65521, the second accumulating the first.
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 // Inflate the zlib stream starting at `start`. Node's inflateSync ignores
-// trailing bytes but gives no consumed length, so locate the stream end by
-// exponential probing followed by a binary search for the smallest end that
-// inflates to exactly `expectedSize` bytes.
+// trailing bytes, so one call on the whole remainder yields the object;
+// the stream's end is then found by scanning for its Adler-32 checksum
+// (the 4 bytes right after the deflate data) and verifying the guess with
+// a second inflate of just that slice. A wrong guess fails verification
+// and the scan continues; if no guess verifies, fall back to locating the
+// end by exponential probing plus a binary search.
 function inflateAt(
   buf: Buffer,
   start: number,
   limit: number,
   expectedSize: number,
 ): { data: Buffer; end: number } {
+  const fast = (end: number): Buffer | null => {
+    try {
+      const out = inflateSync(buf.subarray(start, end));
+      return out.length === expectedSize ? out : null;
+    } catch {
+      return null;
+    }
+  };
+  const data = fast(limit);
+  if (data !== null) {
+    const checksum = adler32(data);
+    const c0 = (checksum >>> 24) & 0xff;
+    const c1 = (checksum >>> 16) & 0xff;
+    const c2 = (checksum >>> 8) & 0xff;
+    const c3 = checksum & 0xff;
+    for (let p = start + 2; p + 4 <= limit; p++) {
+      if (buf[p] === c0 && buf[p + 1] === c1 && buf[p + 2] === c2 && buf[p + 3] === c3) {
+        if (fast(p + 4) !== null) return { data, end: p + 4 };
+      }
+    }
+  }
   const attempt = (end: number): Buffer | null => {
     try {
       const out = inflateSync(buf.subarray(start, end));
@@ -379,7 +415,10 @@ export function writePack(objects: { type: ObjType; data: Buffer; sha: string }[
       varint.push(b);
     }
     parts.push(Buffer.from(varint));
-    parts.push(deflateSync(obj.data));
+    // Fast compression: the pack only has to be valid, and the receiver
+    // inflates it with standard zlib; level 1 is far cheaper than the
+    // default and the size difference is negligible at these sizes.
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1Hex(body), 'hex');

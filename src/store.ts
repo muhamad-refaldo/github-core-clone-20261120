@@ -192,7 +192,11 @@ export class Store {
    * "<type> <byte-length>\0" followed by the raw data, exactly the id a git
    * client computes for the same object.
    */
-  putObject(repo: Repo, type: ObjType, data: Buffer): string {
+  putObject(repo: Repo, type: ObjType, data: Buffer, knownSha?: string): string {
+    if (knownSha !== undefined) {
+      repo.objects.set(knownSha, { type, data });
+      return knownSha;
+    }
     const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
     const id = sha1(Buffer.concat([header, data]));
     repo.objects.set(id, { type, data });

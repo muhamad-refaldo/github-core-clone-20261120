@@ -316,7 +316,7 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return Buffer.concat(chunks);
 }
 
-export function readPack(buf: Buffer): { type: ObjType; data: Buffer }[] {
+export function readPack(buf: Buffer): { type: ObjType; data: Buffer; sha: string }[] {
   if (buf.length < 12 + 20) throw new Error('pack: too short');
   if (buf.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('pack: bad magic');
@@ -331,7 +331,7 @@ export function readPack(buf: Buffer): { type: ObjType; data: Buffer }[] {
 
   const byOffset = new Map<number, { type: ObjType; data: Buffer }>();
   const bySha = new Map<string, { type: ObjType; data: Buffer }>();
-  const out: { type: ObjType; data: Buffer }[] = [];
+  const out: { type: ObjType; data: Buffer; sha: string }[] = [];
 
   const resolveAt = (offset: number): { type: ObjType; data: Buffer } => {
     const hit = byOffset.get(offset);
@@ -383,8 +383,9 @@ export function readPack(buf: Buffer): { type: ObjType; data: Buffer }[] {
       throw new Error(`pack: unknown object type code ${code}`);
     }
     byOffset.set(entryOffset, obj);
-    bySha.set(hashObject(obj.type, obj.data), obj);
-    out.push(obj);
+    const sha = hashObject(obj.type, obj.data);
+    bySha.set(sha, obj);
+    out.push({ type: obj.type, data: obj.data, sha });
   }
   if (pos !== trailerStart) throw new Error('pack: trailing bytes before trailer');
   return out;
